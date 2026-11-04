@@ -27,11 +27,11 @@ from transformers import (
 )
 from transformers.modeling_outputs import ModelOutput
 
+from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
+
 LayerCache = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 
 _log = logging.getLogger(__name__)
-
-from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
 # =============================================================================
 # Custom Output Classes
@@ -222,7 +222,10 @@ def _cached_attention(
     attn_mask: Optional[torch.Tensor],
     key_padding_mask: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """Use the packed, batch-first attention modules constructed by this decoder."""
+    """Attention modules use packed weights and batch-first inputs.
+
+    The decoder uses no bias_k, bias_v, or add_zero_attn.
+    """
     batch, heads, length, head_dim = query.shape
     if attn_mask is not None:
         if attn_mask.dtype == torch.bool:
