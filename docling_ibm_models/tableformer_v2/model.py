@@ -27,6 +27,8 @@ from transformers import (
 )
 from transformers.modeling_outputs import ModelOutput
 
+LayerCache = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+
 _log = logging.getLogger(__name__)
 
 from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
@@ -50,13 +52,13 @@ class TableFormerV2Output(ModelOutput):
     predicted_bboxes : torch.Tensor, optional
         Predicted bounding boxes in xyxy format [0,1], shape (N, 4)
     past_key_values : tuple, optional
-        Cached key-value pairs for autoregressive generation
+        Per-layer self K/V and image K/V, each shaped (B, heads, S, head_dim)
     """
 
     logits: Optional[torch.Tensor] = None
     hidden_states: Optional[torch.Tensor] = None
     predicted_bboxes: Optional[torch.Tensor] = None
-    past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None
+    past_key_values: Optional[Tuple[LayerCache, ...]] = None
 
 
 # =============================================================================
@@ -207,6 +209,48 @@ class SimpleFPN(nn.Module):
 # =============================================================================
 
 
+def _split_heads(x: torch.Tensor, num_heads: int) -> torch.Tensor:
+    batch, length, dim = x.shape
+    return x.view(batch, length, num_heads, dim // num_heads).transpose(1, 2)
+
+
+def _cached_attention(
+    attention: nn.MultiheadAttention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    key_padding_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Use the packed, batch-first attention modules constructed by this decoder."""
+    batch, heads, length, head_dim = query.shape
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_mask = torch.zeros_like(attn_mask, dtype=query.dtype).masked_fill(
+                attn_mask, float("-inf")
+            )
+        if attn_mask.ndim == 3:
+            attn_mask = attn_mask.view(batch, heads, length, key.shape[2])
+    if key_padding_mask is not None:
+        if key_padding_mask.dtype == torch.bool:
+            key_padding_mask = torch.zeros_like(
+                key_padding_mask, dtype=query.dtype
+            ).masked_fill(key_padding_mask, float("-inf"))
+        padding = key_padding_mask[:, None, None, :]
+        attn_mask = padding if attn_mask is None else attn_mask + padding
+    result = torch.nn.functional.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=attn_mask,
+        dropout_p=attention.dropout if attention.training else 0.0,
+    )
+    result = result.transpose(1, 2).reshape(batch, length, heads * head_dim)
+    return torch.nn.functional.linear(
+        result, attention.out_proj.weight, attention.out_proj.bias
+    )
+
+
 class CachedTransformerDecoderLayer(nn.Module):
     r"""
     Cache-aware Transformer decoder layer for efficient autoregressive generation.
@@ -246,23 +290,30 @@ class CachedTransformerDecoderLayer(nn.Module):
         past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        k = v = x
-        if past_kv is not None:
-            past_k, past_v = past_kv
-            k = torch.cat([past_k, k], dim=1)
-            v = torch.cat([past_v, v], dim=1)
-
-        attn_output, _ = self.self_attn(
-            x,
-            k,
-            v,
-            attn_mask=attn_mask,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
+        if past_kv is None and not use_cache:
+            output, _ = self.self_attn(
+                x,
+                x,
+                x,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=False,
+            )
+            return output, None
+        attention = self.self_attn
+        query, key, value = torch.nn.functional.linear(
+            x, attention.in_proj_weight, attention.in_proj_bias
+        ).chunk(3, dim=-1)
+        query, key, value = (
+            _split_heads(item, attention.num_heads) for item in (query, key, value)
         )
-
-        present = (k, v) if use_cache else None
-        return attn_output, present
+        if past_kv is not None:
+            key = torch.cat([past_kv[0], key], dim=2)
+            value = torch.cat([past_kv[1], value], dim=2)
+        output = _cached_attention(
+            attention, query, key, value, attn_mask, key_padding_mask
+        )
+        return output, ((key, value) if use_cache else None)
 
     def _ca_block(
         self,
@@ -270,16 +321,45 @@ class CachedTransformerDecoderLayer(nn.Module):
         mem: torch.Tensor,
         attn_mask: Optional[torch.Tensor],
         key_padding_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        attn_output, _ = self.multihead_attn(
-            x,
-            mem,
-            mem,
-            attn_mask=attn_mask,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        attention = self.multihead_attn
+        if past_kv is None and not use_cache:
+            output, _ = attention(
+                x,
+                mem,
+                mem,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=False,
+            )
+            return output, None
+        dim = attention.embed_dim
+        bias = attention.in_proj_bias
+        query = _split_heads(
+            torch.nn.functional.linear(
+                x,
+                attention.in_proj_weight[:dim],
+                bias[:dim] if bias is not None else None,
+            ),
+            attention.num_heads,
         )
-        return attn_output
+        if past_kv is None:
+            key, value = torch.nn.functional.linear(
+                mem,
+                attention.in_proj_weight[dim:],
+                bias[dim:] if bias is not None else None,
+            ).chunk(2, dim=-1)
+            key, value = (
+                _split_heads(item, attention.num_heads) for item in (key, value)
+            )
+        else:
+            key, value = past_kv
+        output = _cached_attention(
+            attention, query, key, value, attn_mask, key_padding_mask
+        )
+        return output, ((key, value) if use_cache else None)
 
     def forward(
         self,
@@ -289,22 +369,35 @@ class CachedTransformerDecoderLayer(nn.Module):
         memory_mask: Optional[torch.Tensor] = None,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        past_key_value: Optional[LayerCache] = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[LayerCache]]:
+        if past_key_value is not None and len(past_key_value) != 4:
+            raise ValueError(
+                "Expected four projected cache tensors: self K/V and image K/V"
+            )
         sa_out, present_kv = self._sa_block(
             tgt,
             tgt_mask,
             tgt_key_padding_mask,
-            past_kv=past_key_value,
+            past_kv=past_key_value[:2] if past_key_value is not None else None,
             use_cache=use_cache,
         )
         tgt = self.norm1(tgt + self.dropout(sa_out))
-        ca_out = self._ca_block(tgt, memory, memory_mask, memory_key_padding_mask)
+        ca_out, cross_kv = self._ca_block(
+            tgt,
+            memory,
+            memory_mask,
+            memory_key_padding_mask,
+            past_kv=past_key_value[2:] if past_key_value is not None else None,
+            use_cache=use_cache,
+        )
         tgt = self.norm2(tgt + self.dropout(ca_out))
         ff = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = self.norm3(tgt + self.dropout(ff))
-        return tgt, present_kv
+        if present_kv is not None and cross_kv is not None:
+            return tgt, (present_kv[0], present_kv[1], cross_kv[0], cross_kv[1])
+        return tgt, None
 
 
 class CachedTransformerDecoder(nn.Module):
@@ -340,12 +433,10 @@ class CachedTransformerDecoder(nn.Module):
         memory_mask: Optional[torch.Tensor] = None,
         tgt_key_padding_mask: Optional[torch.Tensor] = None,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+        past_key_values: Optional[Tuple[LayerCache, ...]] = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]]]:
-        next_past: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = (
-            [] if use_cache else None
-        )
+    ) -> Tuple[torch.Tensor, Optional[Tuple[LayerCache, ...]]]:
+        next_past: Optional[List[LayerCache]] = [] if use_cache else None
         for i, layer in enumerate(self.layers):
             past = past_key_values[i] if past_key_values is not None else None
             tgt, present = layer(
@@ -720,7 +811,7 @@ class TableFormerV2(PreTrainedModel, GenerationMixin):
             and len(past_key_values) > 0
             and past_key_values[0] is not None
         ):
-            past_length = past_key_values[0][0].shape[1]
+            past_length = past_key_values[0][0].shape[2]
 
         tgt = self.input_embedding(input_ids) + self._positional_encoding(
             batch_size, seq_len, offset=past_length
